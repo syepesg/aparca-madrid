@@ -1,0 +1,75 @@
+name: Monitor de plazas
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recuperar memoria (rama state)
+        run: |
+          if git ls-remote --exit-code origin state >/dev/null 2>&1; then
+            git fetch --depth 1 origin state
+            mkdir -p state && git --work-tree=state checkout origin/state -- .
+            git reset -q
+          fi
+          ls state 2>/dev/null | head || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Analizar cámaras con YOLO
+        run: python monitor/run.py --model models/yolo11s-960.onnx --state state --out site/data --budget 600
+
+      - name: Guardar memoria (rama state, un solo commit)
+        run: |
+          cd state
+          git init -q -b state
+          git config user.name "aparca-bot"
+          git config user.email "aparca-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "estado $(date -u +%FT%TZ)"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" state
+
+      - name: Preparar web
+        run: |
+          mkdir -p site/models
+          cp models/yolo11n.onnx site/models/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Mantener el cron activo (GitHub lo desactiva tras 60 días sin actividad)
+        if: always()
+        run: |
+          curl -s -X PUT -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/monitor.yml/enable" || true
