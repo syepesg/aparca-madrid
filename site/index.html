@@ -70,6 +70,8 @@ header.brand { display: flex; align-items: center; gap: 12px; padding: calc(14px
 .tools { display: flex; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: center; }
 .chip { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 5px 12px; font-size: 13px; font-weight: 600; }
 .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.maplegend { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.maplegend .mk { display: inline-block; border-width: 1.5px; margin-left: 6px; }
 .tools .meta { margin-left: auto; font: 12px var(--font-mono); color: var(--muted); }
 
 .list { overflow-y: auto; flex: 1; min-height: 0; }
@@ -127,8 +129,8 @@ header.brand { display: flex; align-items: center; gap: 12px; padding: calc(14px
 /* Marcadores */
 .mk { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font: 700 14px/1 var(--font-display); color: #fff; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.35); }
 .mk.free { background: #128a4a; width: 32px; height: 32px; font-size: 18px; }
-.mk.full { background: #c23a32; }
-.mk.learn { background: #8a96a6; width: 14px; height: 14px; border-width: 2px; }
+.mk.full { background: #c23a32; width: 16px; height: 16px; }
+.mk.learn { background: #8a96a6; width: 10px; height: 10px; border-width: 1.5px; opacity: .8; }
 .leaflet-container { font-family: var(--font-body); }
 .leaflet-container { background: var(--surface-2); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .osm { filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6); } }
@@ -166,6 +168,7 @@ header.brand { display: flex; align-items: center; gap: 12px; padding: calc(14px
       <button class="chip" id="f-free" type="button" aria-pressed="true">Con hueco</button>
       <button class="chip" id="f-all" type="button" aria-pressed="false">Todas con plazas</button>
       <span class="meta" id="updated">cargando…</span>
+      <span class="maplegend"><i class="mk free" style="width:14px;height:14px"></i>hueco <i class="mk full" style="width:12px;height:12px"></i>completo <i class="mk learn"></i>aprendiendo</span>
     </div>
     <div class="list" id="list">
       <div class="empty">Cargando estado de las cámaras…</div>
@@ -269,8 +272,8 @@ function markerIcon(cam) {
   const free = cam.free, slots = cam.slots.length;
   let cls = "learn", txt = "";
   if (slots && free) { cls = "free"; txt = free; }
-  else if (slots) { cls = "full"; txt = "0"; }
-  return L.divIcon({ className: "", html: `<div class="mk ${cls}">${txt}</div>`, iconSize: cls === "free" ? [32, 32] : cls === "full" ? [26, 26] : [14, 14] });
+  else if (slots) { cls = "full"; }
+  return L.divIcon({ className: "", html: `<div class="mk ${cls}">${txt}</div>`, iconSize: cls === "free" ? [32, 32] : cls === "full" ? [16, 16] : [10, 10] });
 }
 
 function drawMarkers() {
