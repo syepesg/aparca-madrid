@@ -20,11 +20,13 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      - run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Recuperar memoria (rama state)
@@ -67,6 +69,18 @@ jobs:
 
       - id: deploy
         uses: actions/deploy-pages@v4
+
+      # El cron de GitHub puede retrasarse o no dispararse en repos nuevos: cada pasada
+      # encadena la siguiente ~10 min después. La cola de concurrencia deja como mucho
+      # una pendiente, así que cron + cadena nunca se multiplican. Desactivar: variable CHAIN=off.
+      - name: Encadenar la siguiente pasada
+        if: always() && vars.CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          wait=$(( 540 - ($(date +%s) - T0) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+          gh workflow run monitor.yml -R "${{ github.repository }}"
 
       - name: Mantener el cron activo (GitHub lo desactiva tras 60 días sin actividad)
         if: always()
