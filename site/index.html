@@ -191,8 +191,9 @@ header.brand { display: flex; align-items: center; gap: 12px; padding: calc(14px
     </div>
     <div class="legend">
       <span><i style="border-color:#2fd47a;background:rgba(47,212,122,.25)"></i>Libre</span>
-      <span><i style="border-color:#f2c14e;background:rgba(242,193,78,.25)"></i>Libre (1 captura, por confirmar)</span>
+      <span><i style="border-color:#f2c14e;background:rgba(242,193,78,.25)"></i>Libre en 1 imagen (por confirmar)</span>
       <span><i style="border-color:#ff5a4f"></i>Ocupada</span>
+      <span><i style="border-color:#aab4be"></i>Sin dato reciente</span>
       <span><i style="border-color:#ffffff;border-style:dashed"></i>Vehículo detectado</span>
     </div>
     <div class="actions">
@@ -203,7 +204,7 @@ header.brand { display: flex; align-items: center; gap: 12px; padding: calc(14px
     <div class="live-status" id="d-live-status"></div>
     <div class="facts" id="d-facts"></div>
     <div class="hours" id="d-hours"></div>
-    <p class="note">Una "plaza" es un sitio donde el sistema ha visto un coche quieto varias veces. No sabe si es zona SER, carga y descarga o un vado: compruébalo al llegar.</p>
+    <p class="note">Una "plaza" es un sitio donde el sistema ha visto el mismo coche quieto en varias capturas. No sabe si es zona SER, carga y descarga o un vado: compruébalo al llegar.</p>
   </div>
 </div>
 
@@ -214,7 +215,6 @@ const DATA_URL = "data/status.json";
 const MODEL_URL = "models/yolo11n.onnx";
 const ORT_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
 const VEHICLES = new Set([2, 3, 5, 7]);
-const OCC_IOU = 0.25, OCC_COVER = 0.45;
 
 let status = null, map, layer, userPos = null, filter = "free", current = null;
 const markers = new Map();
@@ -256,7 +256,69 @@ function toast(msg) {
   const t = document.createElement("div"); t.className = "toast"; t.textContent = msg;
   document.body.appendChild(t); setTimeout(() => t.remove(), 4000);
 }
-function freeSlots(cam) { return cam.slots.filter((s) => s.state === "free"); }
+/* ---------- apariencia (mismas reglas que monitor/slots.py) ---------- */
+const TW = 48, TH = 27, PW = 12, PH = 8;
+const VIEW_SIM = 0.75, STILL_THERE_SIM = 0.55;
+function b64bytes(s) { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+function pixels(bmp, sx, sy, sw, sh, w, h) {
+  const cv = new OffscreenCanvas(w, h), ctx = cv.getContext("2d");
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bmp, sx, sy, sw, sh, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h).data;
+}
+function grayThumb(bmp) {
+  const d = pixels(bmp, 0, 0, bmp.width, bmp.height, TW, TH), g = new Float32Array(TW * TH);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  return g;
+}
+function boxMask(boxes) {
+  const m = new Uint8Array(TW * TH).fill(1);
+  for (const [x0, y0, x1, y1] of boxes)
+    for (let y = Math.floor(y0 * TH); y < Math.min(TH, Math.ceil(y1 * TH)); y++)
+      for (let x = Math.floor(x0 * TW); x < Math.min(TW, Math.ceil(x1 * TW)); x++) m[y * TW + x] = 0;
+  return m;
+}
+function gradMag(g) {
+  const o = new Float32Array(g.length);
+  const at = (x, y) => g[y * TW + x];
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const gx = x === 0 ? at(1, y) - at(0, y) : x === TW - 1 ? at(x, y) - at(x - 1, y) : (at(x + 1, y) - at(x - 1, y)) / 2;
+    const gy = y === 0 ? at(x, 1) - at(x, 0) : y === TH - 1 ? at(x, y) - at(x, y - 1) : (at(x, y + 1) - at(x, y - 1)) / 2;
+    o[y * TW + x] = Math.hypot(gx, gy);
+  }
+  return o;
+}
+function ncc(a, b, m) {
+  let n = 0, sa = 0, sb = 0;
+  for (let i = 0; i < a.length; i++) if (m[i]) { n++; sa += a[i]; sb += b[i]; }
+  if (n < 50) return 0;
+  const ma = sa / n, mb = sb / n; let num = 0, da = 0, db = 0;
+  for (let i = 0; i < a.length; i++) if (m[i]) { const x = a[i] - ma, y = b[i] - mb; num += x * y; da += x * x; db += y * y; }
+  return da && db ? num / Math.sqrt(da * db) : 0;
+}
+function sceneSim(a, b, m) { return 0.5 * ncc(a, b, m) + 0.5 * ncc(gradMag(a), gradMag(b), m); }
+function patchOf(bmp, box) {
+  const [x0, y0, x1, y1] = box, mx = (x1 - x0) * 0.12, my = (y1 - y0) * 0.12, W = bmp.width, H = bmp.height;
+  const sx = (x0 + mx) * W, sy = (y0 + my) * H;
+  return pixels(bmp, sx, sy, Math.max(2, (x1 - mx) * W - sx), Math.max(2, (y1 - my) * H - sy), PW, PH);
+}
+function patchSim(a, b) {   // a: RGBA del canvas, b: RGB guardado por el servidor
+  const n = PW * PH, ga = new Float32Array(n), gb = new Float32Array(n), ca = [0, 0, 0], cb = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 3; c++) { ca[c] += a[i * 4 + c]; cb[c] += b[i * 3 + c]; }
+    ga[i] = (a[i * 4] + a[i * 4 + 1] + a[i * 4 + 2]) / 3; gb[i] = (b[i * 3] + b[i * 3 + 1] + b[i * 3 + 2]) / 3;
+  }
+  const mean = (v) => v.reduce((s, x) => s + x, 0) / v.length;
+  const std = (v, m) => Math.sqrt(v.reduce((s, x) => s + (x - m) ** 2, 0) / v.length);
+  const ma = mean(ga), mb = mean(gb), sa = std(ga, ma), sb = std(gb, mb);
+  let struct;
+  if (sa < 6 && sb < 6) struct = 1; else if (sa < 6 || sb < 6) struct = 0;
+  else { let s = 0; for (let i = 0; i < n; i++) s += (ga[i] - ma) * (gb[i] - mb); struct = s / n / (sa * sb); }
+  const ta = ca[0] + ca[1] + ca[2] + 1e-6, tb = cb[0] + cb[1] + cb[2] + 1e-6;
+  const chroma = Math.abs(ca[0] / ta - cb[0] / tb) + Math.abs(ca[1] / ta - cb[1] / tb) + Math.abs(ca[2] / ta - cb[2] / tb);
+  const light = Math.abs(ma - mb) / (Math.max(ma, mb) + 1e-6);
+  return Math.max(0, Math.min(1, 0.65 * Math.max(struct, 0) + 0.35 * (1 - Math.min(1, chroma * 6)) - 0.5 * Math.max(0, light - 0.35)));
+}
 
 /* ---------- mapa ---------- */
 function initMap() {
@@ -269,17 +331,16 @@ function initMap() {
 }
 
 function markerIcon(cam) {
-  const free = cam.free, slots = cam.slots.length;
   let cls = "learn", txt = "";
-  if (slots && free) { cls = "free"; txt = free; }
-  else if (slots) { cls = "full"; }
+  if (cam.slots && cam.free) { cls = "free"; txt = cam.free; }
+  else if (cam.slots) { cls = "full"; }
   return L.divIcon({ className: "", html: `<div class="mk ${cls}">${txt}</div>`, iconSize: cls === "free" ? [32, 32] : cls === "full" ? [16, 16] : [10, 10] });
 }
 
 function drawMarkers() {
   layer.clearLayers(); markers.clear();
   for (const cam of status.cameras) {
-    const m = L.marker([cam.lat, cam.lon], { icon: markerIcon(cam), title: cam.name, zIndexOffset: cam.free ? 1000 : cam.slots.length ? 500 : 0 });
+    const m = L.marker([cam.lat, cam.lon], { icon: markerIcon(cam), title: cam.name, zIndexOffset: cam.free ? 1000 : cam.slots ? 500 : 0 });
     m.on("click", () => openCam(cam.id));
     m.addTo(layer); markers.set(cam.id, m);
   }
@@ -288,16 +349,16 @@ function drawMarkers() {
 /* ---------- lista ---------- */
 function renderList() {
   const cams = status.cameras;
-  const totalSlots = cams.reduce((n, c) => n + c.slots.length, 0);
+  const totalSlots = cams.reduce((n, c) => n + c.slots, 0);
   const totalFree = cams.reduce((n, c) => n + c.free, 0);
   $("s-free").textContent = totalFree;
   $("s-slots").textContent = totalSlots;
   $("s-cams").textContent = cams.length;
   $("updated").textContent = `actualizado ${hhmm(status.generated)}`;
 
-  let rows = cams.filter((c) => (filter === "free" ? c.free > 0 : c.slots.length > 0));
+  let rows = cams.filter((c) => (filter === "free" ? c.free > 0 : c.slots > 0));
   const dist = (c) => (userPos ? km(userPos, c) : null);
-  rows.sort((a, b) => userPos ? dist(a) - dist(b) : (b.free - a.free) || (b.slots.length - a.slots.length));
+  rows.sort((a, b) => userPos ? dist(a) - dist(b) : (b.free - a.free) || (b.slots - a.slots));
 
   const list = $("list");
   list.innerHTML = "";
@@ -308,18 +369,15 @@ function renderList() {
   if (!rows.length) {
     const e = document.createElement("div"); e.className = "empty";
     e.innerHTML = totalSlots
-      ? "<b>No hay huecos libres detectados ahora mismo.</b> Prueba “Todas con plazas” o pulsa “Vigilar” en una cámara para recibir un aviso."
-      : "<b>El sistema está aprendiendo dónde se aparca.</b> Cada 10 minutos analiza las 357 cámaras; una plaza aparece cuando ve el mismo coche quieto en varias capturas. Las primeras salen tras 20–30 minutos.";
+      ? "<b>No hay huecos libres confirmados ahora mismo.</b> Prueba “Todas con plazas” o pulsa “Vigilar” en una cámara para recibir un aviso."
+      : "<b>El sistema está aprendiendo dónde se aparca.</b> Una plaza aparece cuando ve el mismo coche quieto en al menos cuatro capturas seguidas, así que las primeras tardan 30–40 minutos.";
     list.appendChild(e);
   }
   for (const c of rows.slice(0, 80)) {
     const b = document.createElement("button"); b.className = "row"; b.type = "button";
-    const fs = freeSlots(c);
-    const newest = fs.length ? Math.max(...fs.map((s) => s.since)) : 0;
-    const unsure = fs.length && fs.every((s) => !s.sure);
-    const sub = fs.length
-      ? `<span class="pill ${unsure ? "maybe" : "free"}">${unsure ? "por confirmar" : "libre"}</span> ${ago(newest)} · ${c.slots.length} plazas`
-      : `<span class="pill busy">completo</span> ${c.slots.length} plazas vigiladas`;
+    const sub = c.free
+      ? `<span class="pill free">libre</span> ${ago(c.free_since)} · ${c.slots} plazas`
+      : `<span class="pill busy">completo</span> ${c.slots} plazas vigiladas`;
     b.innerHTML = `<div class="count ${c.free ? "" : "zero"}">${c.free}</div>
       <div style="min-width:0"><div class="name"></div><div class="sub">${sub}</div></div>
       <div class="dist">${userPos ? fmtDist(dist(c)) : ""}</div>`;
@@ -328,23 +386,25 @@ function renderList() {
     list.appendChild(b);
   }
 
-  const learning = cams.filter((c) => !c.slots.length && c.candidates > 0).length;
+  const learning = cams.filter((c) => !c.slots && c.learning > 0).length;
+  const moving = cams.filter((c) => c.views > 1).length;
   const about = document.createElement("section"); about.className = "about";
   about.innerHTML = `<h2>Cómo funciona</h2>
     <p>Cada ~10 minutos un proceso gratuito en GitHub Actions descarga las imágenes de las ${cams.length} cámaras públicas de tráfico del Ayuntamiento y detecta vehículos con YOLO11.</p>
-    <p>Un coche que sigue exactamente en el mismo sitio entre dos capturas está aparcado. Cuando eso se repite, ese sitio pasa a ser una plaza vigilada; si después queda vacío, aparece aquí como hueco libre. Hay ${learning} cámaras más con plazas en aprendizaje.</p>
-    <p>Las cámaras enfocan sobre todo calzadas, así que solo una parte muestra aparcamiento. Desde la ficha de una cámara puedes analizar la imagen en directo con YOLO en tu propio dispositivo.</p>
+    <p>Un sitio pasa a ser plaza cuando el mismo coche (misma posición y mismo aspecto) sigue allí en varias capturas. Se da por libre solo si YOLO no ve nada encima y además la imagen de la plaza ha cambiado respecto a cuando estaba el coche, en dos capturas seguidas.</p>
+    <p>Muchas cámaras son motorizadas y cambian de encuadre: cada encuadre tiene sus propias plazas (${moving} cámaras tienen varios). Hay ${learning} cámaras más con plazas en aprendizaje.</p>
     <p>Última pasada: ${status.stats.processed} imágenes nuevas, ${status.stats.unchanged} sin cambios, ${status.stats.failed} sin respuesta, ${status.stats.seconds} s.</p>`;
   list.appendChild(about);
 }
 
 /* ---------- detalle de cámara ---------- */
 let liveDets = null, liveTs = null, watchTimer = null, wakeLock = null, lastImg = null;
+let detail = null, view = null, liveFree = new Map();
 
 async function openCam(id) {
   const cam = status.cameras.find((c) => c.id === id);
   if (!cam) return;
-  current = cam; liveDets = null; liveTs = null; stopWatch();
+  current = cam; detail = null; view = null; liveDets = null; liveTs = null; lastLiveTs = null; liveFree = new Map(); stopWatch();
   $("detail").hidden = false;
   $("d-title").textContent = cam.name;
   $("d-sub").textContent = `Cámara ${cam.id} · ${cam.lat.toFixed(5)}, ${cam.lon.toFixed(5)}`;
@@ -352,7 +412,22 @@ async function openCam(id) {
   $("d-live-status").textContent = cam.ts ? `Último análisis del servidor: imagen de las ${hhmm(cam.ts)} (${ago(cam.ts)}).` : "";
   renderFacts();
   map.setView([cam.lat, cam.lon], Math.max(map.getZoom(), 15));
+  try { detail = await (await fetch(`data/cams/${id}.json?t=${status.generated}`)).json(); } catch { detail = { views: [], dets: [] }; }
+  if (cam !== current) return;
   await loadImage(false);
+}
+
+function pickView(bmp, dets) {
+  // reconocer qué encuadre muestra la imagen (las cámaras motorizadas cambian de posición)
+  view = null;
+  if (!detail || !detail.views.length) return;
+  const t = grayThumb(bmp), m = boxMask(dets || []);
+  let best = -1;
+  for (const v of detail.views) {
+    const vt = Float32Array.from(b64bytes(v.thumb));
+    const s = sceneSim(t, vt, m);
+    if (s > best) { best = s; if (s >= VIEW_SIM) view = v; }
+  }
 }
 
 async function loadImage(fresh) {
@@ -365,9 +440,10 @@ async function loadImage(fresh) {
     const bmp = await createImageBitmap(blob);
     if (cam !== current) return null;
     lastImg = bmp;
-    if (lm) liveTs = Date.parse(lm) / 1000;
+    liveTs = lm ? Date.parse(lm) / 1000 : null;
+    if (!fresh) pickView(bmp, sameAsServer() ? detail.dets : []);
     $("d-loading").hidden = true;
-    drawOverlay();
+    drawOverlay(); renderFacts();
     return bmp;
   } catch (e) {
     $("d-loading").textContent = "La cámara no responde ahora mismo.";
@@ -375,12 +451,18 @@ async function loadImage(fresh) {
   }
 }
 
+function sameAsServer() { return detail && liveTs && Math.abs(liveTs - detail.ts) < 2; }
+
 function slotStates() {
-  // con análisis en directo se recalcula el estado; si no, se usa el del servidor
-  return current.slots.map((s) => {
-    if (!liveDets) return { ...s };
-    const occ = liveDets.some((d) => iou(s.box, d) >= OCC_IOU || cover(s.box, d) >= OCC_COVER);
-    return { ...s, state: occ ? "occupied" : "free", sure: true };
+  if (!view) return [];
+  const serverView = view.id === detail.view && sameAsServer();
+  return view.slots.map((s) => {
+    if (!liveDets) return serverView ? { ...s } : { ...s, state: "unknown" };
+    const hit = liveDets.some((d) => iou(s.box, d) >= 0.2 || cover(s.box, d) >= 0.3);
+    let occ = hit;
+    if (!hit) occ = !s.ref || patchSim(patchOf(lastImg, s.box), b64bytes(s.ref)) >= STILL_THERE_SIM;
+    const n = occ ? 0 : (liveFree.get(s.id) || 0) + 1;
+    return { ...s, state: occ ? "occupied" : "free", sure: n >= 2, liveN: n };
   });
 }
 
@@ -390,14 +472,14 @@ function drawOverlay() {
   cv.width = lastImg.width; cv.height = lastImg.height;
   ctx.drawImage(lastImg, 0, 0);
   const W = cv.width, H = cv.height, lw = Math.max(2, W / 400);
-  const dets = liveDets || current.dets;
+  const dets = liveDets || (sameAsServer() ? detail.dets : []);
   ctx.setLineDash([lw * 3, lw * 2]); ctx.lineWidth = lw; ctx.strokeStyle = "rgba(255,255,255,.8)";
   for (const d of dets) ctx.strokeRect(d[0] * W, d[1] * H, (d[2] - d[0]) * W, (d[3] - d[1]) * H);
   ctx.setLineDash([]); ctx.lineWidth = lw * 1.6;
   for (const s of slotStates()) {
     const [x1, y1, x2, y2] = s.box;
-    const free = s.state === "free" || s.state === "stale";
-    const col = free ? (s.sure ? "47,212,122" : "242,193,78") : "255,90,79";
+    const free = s.state === "free";
+    const col = s.state === "unknown" || s.state === "stale" ? "170,180,190" : free ? (s.sure ? "47,212,122" : "242,193,78") : "255,90,79";
     if (free) { ctx.fillStyle = `rgba(${col},.28)`; ctx.fillRect(x1 * W, y1 * H, (x2 - x1) * W, (y2 - y1) * H); }
     ctx.strokeStyle = `rgb(${col})`;
     ctx.strokeRect(x1 * W, y1 * H, (x2 - x1) * W, (y2 - y1) * H);
@@ -405,35 +487,39 @@ function drawOverlay() {
 }
 
 function renderFacts() {
-  const cam = current, states = slotStates();
-  const free = states.filter((s) => s.state === "free");
+  const cam = current, states = slotStates(), slots = view ? view.slots : [];
+  const free = states.filter((s) => s.state === "free" && s.sure);
+  const maybe = states.filter((s) => s.state === "free" && !s.sure);
   const lastFree = free.length ? Math.max(...free.map((s) => s.since)) : null;
-  const rates = cam.slots.map((s) => s.occ_rate).filter((v) => v != null);
+  const rates = slots.map((s) => s.occ_rate).filter((v) => v != null);
+  const unknown = states.length && states.every((s) => s.state === "unknown");
   const facts = [
-    ["Huecos libres", `${free.length} de ${cam.slots.length}`],
-    ["Libre desde", lastFree ? `${hhmm(lastFree)} (${ago(lastFree)})` : "—"],
+    ["Huecos libres", unknown ? "pulsa Analizar" : `${free.length} de ${slots.length}${maybe.length ? ` (+${maybe.length} por confirmar)` : ""}`],
+    ["Libre desde", lastFree && !liveDets ? `${hhmm(lastFree)} (${ago(lastFree)})` : "—"],
     ["Ocupación media", rates.length ? `${Math.round(100 * rates.reduce((a, b) => a + b, 0) / rates.length)} %` : "aún sin datos"],
-    ["Vehículos en imagen", String((liveDets || cam.dets).length)],
+    ["Encuadres conocidos", detail ? String(detail.views.length) : "…"],
   ];
   if (userPos) facts.push(["Distancia", fmtDist(km(userPos, cam))]);
   $("d-facts").innerHTML = facts.map(([k, v]) => `<div><span>${k}</span><b>${v}</b></div>`).join("");
 
-  // probabilidad de hueco por hora del día (media de plazas)
+  if (!view) {
+    const msg = !detail ? "Cargando…"
+      : detail.views.length ? "La cámara está enfocando ahora una zona donde todavía no se han aprendido plazas (estas cámaras cambian de encuadre). Vuelve a mirar en unos minutos."
+      : `Todavía no se han aprendido plazas en esta cámara${cam.learning ? ` (${cam.learning} en aprendizaje)` : ""}. Puede que enfoque solo a la calzada.`;
+    $("d-hours").innerHTML = `<h4>Plazas</h4><div class="note" style="padding:0">${msg}</div>`;
+    return;
+  }
   const hours = Array.from({ length: 24 }, (_, h) => {
-    const vals = cam.slots.map((s) => s.hours && s.hours[String(h).padStart(2, "0")]).filter((v) => v != null);
+    const vals = slots.map((s) => s.hours && s.hours[String(h).padStart(2, "0")]).filter((v) => v != null);
     return vals.length ? 1 - vals.reduce((a, b) => a + b, 0) / vals.length : null;
   });
   const nowH = new Date().getHours();
-  if (!cam.slots.length) {
-    $("d-hours").innerHTML = `<h4>Plazas</h4><div class="note" style="padding:0">Todavía no se han aprendido plazas en esta cámara${cam.candidates ? ` (${cam.candidates} en aprendizaje)` : ""}. Puede que enfoque solo a la calzada.</div>`;
-    return;
-  }
   $("d-hours").innerHTML = `<h4>Probabilidad de encontrar hueco por hora</h4>
     <div class="bars">${hours.map((v, h) => `<div class="${v == null ? "none" : ""} ${h === nowH ? "now" : ""}" style="height:${v == null ? 4 : Math.max(4, v * 100)}%" title="${h}:00 · ${v == null ? "sin datos" : Math.round(v * 100) + " %"}"></div>`).join("")}</div>
     <div class="axis">${hours.map((_, h) => `<span>${h % 6 === 0 ? h : ""}</span>`).join("")}</div>`;
 }
 
-function closeCam() { $("detail").hidden = true; stopWatch(); current = null; lastImg = null; }
+function closeCam() { $("detail").hidden = true; stopWatch(); current = null; lastImg = null; detail = null; view = null; }
 
 /* ---------- YOLO en el navegador (onnxruntime-web) ---------- */
 let sessionP = null;
@@ -478,39 +564,57 @@ async function detectRegion(session, bmp, roi) {
   return res;
 }
 
-async function detectLive(bmp, slots) {
-  const session = await getSession();
-  let cand = await detectRegion(session, bmp, [0, 0, 1, 1]);
-  if (slots.length) {
-    // segunda pasada ampliada sobre la zona de plazas: los coches lejanos se ven más grandes
-    let x0 = Math.min(...slots.map((s) => s.box[0])), y0 = Math.min(...slots.map((s) => s.box[1]));
-    let x1 = Math.max(...slots.map((s) => s.box[2])), y1 = Math.max(...slots.map((s) => s.box[3]));
-    const mx = Math.max(0.04, (x1 - x0) * 0.12), my = Math.max(0.04, (y1 - y0) * 0.12);
-    const roi = [Math.max(0, x0 - mx), Math.max(0, y0 - my), Math.min(1, x1 + mx), Math.min(1, y1 + my)];
-    if ((roi[2] - roi[0]) * (roi[3] - roi[1]) < 0.6) cand = cand.concat(await detectRegion(session, bmp, roi));
-  }
+function nmsBoxes(cand) {
   cand.sort((a, b) => b.s - a.s);
   const keep = [];
   for (const c of cand) if (keep.every((k) => iou(k, c.b) < 0.5 && cover(c.b, k) < 0.8)) keep.push(c.b);
   return keep;
 }
 
+async function detectLive(bmp) {
+  const session = await getSession();
+  const full = await detectRegion(session, bmp, [0, 0, 1, 1]);
+  pickView(bmp, nmsBoxes(full.slice()));
+  let cand = full;
+  const slots = view ? view.slots : [];
+  if (slots.length) {
+    // segunda pasada ampliada sobre la zona de plazas: los coches lejanos se ven más grandes
+    const x0 = Math.min(...slots.map((s) => s.box[0])), y0 = Math.min(...slots.map((s) => s.box[1]));
+    const x1 = Math.max(...slots.map((s) => s.box[2])), y1 = Math.max(...slots.map((s) => s.box[3]));
+    const mx = Math.max(0.04, (x1 - x0) * 0.12), my = Math.max(0.04, (y1 - y0) * 0.12);
+    const roi = [Math.max(0, x0 - mx), Math.max(0, y0 - my), Math.min(1, x1 + mx), Math.min(1, y1 + my)];
+    if ((roi[2] - roi[0]) * (roi[3] - roi[1]) < 0.6) cand = cand.concat(await detectRegion(session, bmp, roi));
+  }
+  return nmsBoxes(cand);
+}
+
+let lastLiveTs = null;
 async function analyzeLive(silent) {
   const btn = $("d-live"), cam = current;
   btn.disabled = true;
   try {
     $("d-live-status").textContent = sessionP ? "Analizando la imagen más reciente…" : "Descargando el modelo YOLO (10 MB, solo la primera vez)…";
-    const prevFree = new Set(slotStates().filter((s) => s.state === "free").map((s) => s.id));
+    const prevSure = new Set(slotStates().filter((s) => s.state === "free" && s.sure).map((s) => s.id));
     const bmp = await loadImage(true);
     if (!bmp || cam !== current) return;
+    if (liveTs && liveTs === lastLiveTs && liveDets) {   // la cámara aún no ha renovado la imagen
+      drawOverlay(); renderFacts();
+      $("d-live-status").textContent = `La cámara no ha renovado la imagen desde las ${hhmm(liveTs)}. Se vuelve a mirar en un minuto.`;
+      return;
+    }
     const t0 = performance.now();
-    liveDets = await detectLive(bmp, cam.slots);
+    liveDets = await detectLive(bmp);
     if (cam !== current) return;
+    lastLiveTs = liveTs;
     const ms = Math.round(performance.now() - t0);
+    const states = slotStates();
+    liveFree = new Map(states.map((s) => [s.id, s.liveN || 0]));
     drawOverlay(); renderFacts();
-    const nowFree = slotStates().filter((s) => s.state === "free");
-    $("d-live-status").textContent = `Análisis en directo: imagen de las ${liveTs ? hhmm(liveTs) : "—"}, ${liveDets.length} vehículos, ${nowFree.length} huecos (${ms} ms en este dispositivo).`;
-    const newly = nowFree.filter((s) => !prevFree.has(s.id));
+    const sure = states.filter((s) => s.state === "free" && s.sure), maybe = states.filter((s) => s.state === "free" && !s.sure);
+    $("d-live-status").textContent = !view
+      ? `Análisis en directo (${ms} ms): la cámara enfoca ahora una zona sin plazas aprendidas.`
+      : `Análisis en directo: imagen de las ${liveTs ? hhmm(liveTs) : "—"}, ${liveDets.length} vehículos, ${sure.length} huecos${maybe.length ? ` y ${maybe.length} por confirmar en la próxima imagen` : ""} (${ms} ms).`;
+    const newly = sure.filter((s) => !prevSure.has(s.id));
     if (silent && newly.length) notify(`Hueco libre en ${cam.name}`, `${newly.length} plaza(s) se acaban de quedar libres.`);
   } catch (e) {
     console.error(e);

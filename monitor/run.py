@@ -3,10 +3,10 @@
 Cada ejecución:
   1. Descarga la lista de cámaras (datos abiertos del Ayuntamiento) y sus imágenes.
   2. Detecta vehículos con YOLO.
-  3. Aprende "plazas": zonas donde un vehículo permanece quieto entre capturas
-     separadas varios minutos (un coche en circulación nunca repite la misma caja).
-  4. Marca cada plaza como ocupada / libre y registra cuándo se ha liberado.
-  5. Escribe state/<camara>.json (memoria entre ejecuciones) y site/data/status.json (web).
+  3. Reconoce el encuadre de cada cámara (muchas son motorizadas) y actualiza sus plazas
+     con la lógica de slots.py: coche quieto = misma caja y mismo aspecto; libre = sin
+     detección y con la imagen de la plaza cambiada.
+  4. Escribe state/cams/<camara>.json (memoria entre ejecuciones) y site/data/status.json (web).
 """
 from __future__ import annotations
 
@@ -14,50 +14,23 @@ import argparse
 import concurrent.futures as cf
 import email.utils
 import hashlib
+import io
 import json
-import os
 import re
 import time
 import urllib.request
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from pathlib import Path
 
-from detector import VehicleDetector
+from PIL import Image
+
+import slots as sl
+from detector import VehicleDetector, merge_dets
 
 KML_URL = "https://datos.madrid.es/egob/catalogo/202088-0-trafico-camaras.kml"
 UA = {"User-Agent": "madrid-aparca/1.0 (+https://github.com)"}
-
-# Parámetros del aprendizaje de plazas
-MIN_STATIONARY_GAP = 4 * 60      # s entre capturas para considerar un coche "quieto"
-MAX_STATIONARY_GAP = 45 * 60     # más separación no prueba nada (podría ser otro coche)
-STATIONARY_IOU = 0.72            # misma caja en ambas capturas
-SLOT_MATCH_IOU = 0.35            # detección quieta que refuerza una plaza existente
-CONFIRM_OBS = 2                  # veces visto aparcado para confirmar una plaza
-OCC_IOU = 0.25                   # una detección ocupa la plaza
-OCC_COVER = 0.45                 # ... o cubre esta fracción de la plaza (oclusión)
-CANDIDATE_TTL = 3 * 86400        # candidatos no confirmados caducan
-SLOT_TTL = 10 * 86400            # plazas que no vuelven a ocuparse caducan
-STALE_FREE = 18 * 3600           # libre tanto tiempo: probablemente la cámara se movió
 MIN_BRIGHTNESS = 12              # imagen negra / caída
-MADRID = ZoneInfo("Europe/Madrid")
-PARKABLE = {"car", "truck", "motorcycle"}
-
-
-def iou(a, b):
-    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    inter = ix * iy
-    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
-    return inter / ua if ua > 0 else 0.0
-
-
-def cover(slot, det):
-    """Fracción del área de la plaza tapada por la detección."""
-    ix = max(0.0, min(slot[2], det[2]) - max(slot[0], det[0]))
-    iy = max(0.0, min(slot[3], det[3]) - max(slot[1], det[1]))
-    area = (slot[2] - slot[0]) * (slot[3] - slot[1])
-    return ix * iy / area if area > 0 else 0.0
+STALE_FREE = 4 * 3600            # libre tanto tiempo: dudoso, no se cuenta
+STATE_VERSION = 2
 
 
 def fetch(url, timeout=25):
@@ -93,83 +66,9 @@ def load_cameras(cache: Path):
     return cams
 
 
-def update_camera(state: dict, dets: list, ts: float):
-    """Actualiza las plazas aprendidas de una cámara con una nueva captura."""
-    slots = state.setdefault("slots", [])
-    prev = state.get("prev")  # {"ts":..., "dets":[...]}
-    events = []
-
-    # 1) vehículos quietos respecto a la captura anterior
-    stationary = []
-    if prev and MIN_STATIONARY_GAP <= ts - prev["ts"] <= MAX_STATIONARY_GAP:
-        for d in dets:
-            if d["cls"] not in PARKABLE:
-                continue
-            if any(iou(d["box"], p) >= STATIONARY_IOU for p in prev["dets"]):
-                stationary.append(d["box"])
-
-    # 2) reforzar o crear plazas
-    for box in stationary:
-        best, best_iou = None, 0.0
-        for s in slots:
-            v = iou(box, s["box"])
-            if v > best_iou:
-                best, best_iou = s, v
-        if best and best_iou >= SLOT_MATCH_IOU:
-            n = best["obs"]
-            w = 1.0 / min(n + 1, 8)  # media móvil de la caja
-            best["box"] = [round(a * (1 - w) + b * w, 4) for a, b in zip(best["box"], box)]
-            best["obs"] = n + 1
-            best["last_parked"] = ts
-        else:
-            slots.append({
-                "id": hashlib.md5(f"{box}{ts}".encode()).hexdigest()[:8],
-                "box": box, "obs": 1, "first": ts, "last_parked": ts,
-                "state": "occupied", "since": ts, "free_n": 0, "hours": {},
-            })
-
-    # 3) estado de cada plaza
-    all_boxes = [d["box"] for d in dets]
-    hour = datetime.fromtimestamp(ts, MADRID).strftime("%H")
-    for s in slots:
-        occupied = any(iou(s["box"], b) >= OCC_IOU or cover(s["box"], b) >= OCC_COVER for b in all_boxes)
-        if occupied:
-            s["last_occupied"] = ts
-            if s["state"] == "free":
-                s["state"], s["since"] = "occupied", ts
-            s["free_n"] = 0
-        else:
-            s["free_n"] = s.get("free_n", 0) + 1
-            if s["state"] == "occupied":
-                s["state"], s["since"] = "free", ts
-                if s["obs"] >= CONFIRM_OBS:
-                    events.append({"slot": s["id"], "ts": ts})
-        if s["obs"] >= CONFIRM_OBS:
-            h = s.setdefault("hours", {}).setdefault(hour, [0, 0])
-            h[0] += int(occupied)
-            h[1] += 1
-
-    # 4) limpieza
-    keep = []
-    for s in slots:
-        last = max(s.get("last_occupied", 0), s["last_parked"])
-        if s["obs"] < CONFIRM_OBS and ts - s["last_parked"] > CANDIDATE_TTL:
-            continue
-        if ts - last > SLOT_TTL:
-            continue
-        if any(iou(s["box"], k["box"]) > 0.55 for k in keep):  # fusionar duplicados
-            k = max((k for k in keep if iou(s["box"], k["box"]) > 0.55), key=lambda k: k["obs"])
-            k["obs"] = max(k["obs"], s["obs"])
-            continue
-        keep.append(s)
-    state["slots"] = keep
-    state["prev"] = {"ts": ts, "dets": [d["box"] for d in dets if d["cls"] in PARKABLE]}
-    return events
-
-
 def slot_rois(slots):
-    """Zona que engloba las plazas confirmadas, para analizarla ampliada."""
-    boxes = [s["box"] for s in slots if s["obs"] >= CONFIRM_OBS]
+    """Zona que engloba las plazas, para analizarla ampliada."""
+    boxes = [s["box"] for s in slots]
     if not boxes:
         return []
     x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
@@ -181,19 +80,44 @@ def slot_rois(slots):
     return [roi]
 
 
-def slot_public(s, ts):
-    hrs = s.get("hours", {})
-    occ = sum(v[0] for v in hrs.values())
-    tot = sum(v[1] for v in hrs.values())
-    state = s["state"]
-    if state == "free" and ts - s["since"] > STALE_FREE:
-        state = "stale"
-    return {
-        "id": s["id"], "box": s["box"], "state": state, "since": int(s["since"]),
-        "sure": s.get("free_n", 0) >= 2 if s["state"] == "free" else True,
-        "obs": s["obs"], "occ_rate": round(occ / tot, 2) if tot >= 6 else None,
-        "hours": {h: round(v[0] / v[1], 2) for h, v in hrs.items() if v[1] >= 2},
+def analyze(detector, st: dict, img: Image.Image, ts: float):
+    """Detección + encuadre + plazas para una captura. Devuelve (detecciones, eventos)."""
+    dets, w, h, bright = detector.detect_image(img)
+    if bright < MIN_BRIGHTNESS:
+        st["dark"] = True
+        return [], []
+    st["dark"] = False
+    view = sl.assign_view(st, dets, ts, img)
+    rois = slot_rois([s for s in view["slots"] if sl.is_real_slot(s)])
+    if rois:
+        dets = merge_dets(dets, detector.detect_image(img, rois, full=False)[0])
+    return dets, sl.update_view(view, dets, ts, img)
+
+
+def public_camera(cam, st, now):
+    """Resumen para el mapa y la lista (status.json) y detalle para la ficha (cams/<id>.json)."""
+    views = []
+    for v in st.get("views", []):
+        real = [(s, sl.slot_public(s, now, STALE_FREE)) for s in v["slots"] if sl.is_real_slot(s)]
+        if real:
+            views.append({"id": v["id"], "thumb": v["thumb"],
+                          "slots": [dict(p, ref=s.get("ref_occ")) for s, p in real]})
+    cur = next((v for v in views if v["id"] == st.get("view")), None)
+    slots = cur["slots"] if cur else []
+    free = [s for s in slots if s["state"] == "free" and s["sure"]]
+    summary = {
+        **cam,
+        "ts": int(st.get("img_ts", 0)),
+        "dark": st.get("dark", False),
+        "slots": len(slots),
+        "free": len(free),
+        "free_since": max((s["since"] for s in free), default=None),
+        "views": len(views),
+        "learning": sum(1 for v in st.get("views", []) for s in v["slots"] if s["obs"] < sl.CONFIRM_OBS),
     }
+    detail = {"id": cam["id"], "ts": summary["ts"], "view": st.get("view"), "views": views,
+              "dets": [d["box"] for d in st.get("last_dets", [])]}
+    return summary, detail
 
 
 def main():
@@ -208,7 +132,7 @@ def main():
     t0 = time.time()
     state_dir, out_dir = Path(args.state), Path(args.out)
     (state_dir / "cams").mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "cams").mkdir(parents=True, exist_ok=True)
     cams = load_cameras(state_dir / "cameras.json")
     if args.limit:
         cams = cams[: args.limit]
@@ -240,7 +164,8 @@ def main():
                 st = json.loads(sp.read_text())
             except Exception:
                 st = {}
-            dets = st.get("last_dets", [])
+            if st.get("version") != STATE_VERSION:
+                st = {"version": STATE_VERSION}   # memoria de la versión anterior: se reaprende
             over_budget = args.budget and time.time() - t0 > args.budget
             if data is None:
                 failed += 1
@@ -251,28 +176,15 @@ def main():
                 if digest == st.get("digest"):
                     skipped += 1  # imagen sin cambios desde la última vez
                 else:
-                    dets, w, h, bright = detector.detect(data, slot_rois(st.get("slots", [])))
-                    st["digest"], st["img_ts"] = digest, img_ts
-                    if bright < MIN_BRIGHTNESS:
-                        st["dark"] = True
-                        dets = []
-                    else:
-                        st["dark"] = False
-                        for ev in update_camera(st, dets, img_ts):
-                            events.append({"cam": cam["id"], **ev})
-                        st["last_dets"] = dets
+                    img = Image.open(io.BytesIO(data)).convert("RGB")
+                    dets, evs = analyze(detector, st, img, img_ts)
+                    st["digest"], st["img_ts"], st["last_dets"] = digest, img_ts, dets
+                    events += [{"cam": cam["id"], **ev} for ev in evs]
                     processed += 1
                     sp.write_text(json.dumps(st, separators=(",", ":")))
-            slots = [slot_public(s, now) for s in st.get("slots", []) if s["obs"] >= CONFIRM_OBS]
-            public.append({
-                **cam,
-                "ts": int(st.get("img_ts", 0)),
-                "dark": st.get("dark", False),
-                "dets": [d["box"] for d in dets],
-                "slots": slots,
-                "candidates": sum(1 for s in st.get("slots", []) if s["obs"] < CONFIRM_OBS),
-                "free": sum(1 for s in slots if s["state"] == "free"),
-            })
+            summary, detail = public_camera(cam, st, now)
+            public.append(summary)
+            (out_dir / "cams" / f"{cam['id']}.json").write_text(json.dumps(detail, separators=(",", ":")))
 
     events = [e for e in events if now - e["ts"] < 6 * 3600][-500:]
     events_path.write_text(json.dumps(events))
@@ -285,7 +197,7 @@ def main():
     }
     (out_dir / "status.json").write_text(json.dumps(status, separators=(",", ":"), ensure_ascii=False))
     print(json.dumps(status["stats"]),
-          "plazas:", sum(len(c["slots"]) for c in public),
+          "plazas:", sum(c["slots"] for c in public),
           "libres:", sum(c["free"] for c in public))
 
 

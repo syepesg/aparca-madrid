@@ -54,14 +54,17 @@ class VehicleDetector:
         return xyxy.reshape(-1, 4), scores, cls_ids
 
     def detect(self, image_bytes: bytes, rois=()):
-        """Devuelve (detecciones normalizadas 0-1, ancho, alto, brillo medio).
+        """Devuelve (detecciones normalizadas 0-1, ancho, alto, brillo medio)."""
+        return self.detect_image(Image.open(io.BytesIO(image_bytes)).convert("RGB"), rois)
 
-        rois: regiones extra (normalizadas) que se analizan ampliadas, p. ej. la zona de plazas.
-        """
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    def detect_image(self, img: Image.Image, rois=(), full=True):
+        """rois: regiones extra (normalizadas) que se analizan ampliadas, p. ej. la zona de plazas.
+        full=False analiza solo las rois (para combinar luego con merge_dets)."""
         w, h = img.size
         brightness = float(np.asarray(img.convert("L").resize((64, 36))).mean())
-        parts = [self._run(img)] + [self._run(img, roi) for roi in rois]
+        parts = ([self._run(img)] if full else []) + [self._run(img, roi) for roi in rois]
+        if not parts:
+            return [], w, h, brightness
         xyxy = np.concatenate([p[0] for p in parts])
         scores = np.concatenate([p[1] for p in parts])
         cls_ids = np.concatenate([p[2] for p in parts])
@@ -78,6 +81,16 @@ class VehicleDetector:
                 "cls": VEHICLE_CLASSES[int(cls_ids[i])],
             })
         return dets, w, h, brightness
+
+
+def merge_dets(*lists, thr=0.5):
+    """Une listas de detecciones normalizadas quitando duplicados (NMS por confianza)."""
+    dets = [d for lst in lists for d in lst]
+    if not dets:
+        return []
+    idx = nms(np.array([d["box"] for d in dets], dtype=np.float32),
+              np.array([d["conf"] for d in dets], dtype=np.float32), thr)
+    return [dets[i] for i in idx]
 
 
 def nms(boxes: np.ndarray, scores: np.ndarray, thr: float):
