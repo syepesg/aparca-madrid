@@ -1,0 +1,26 @@
+name: eval-gemini
+on:
+  push:
+    branches: [eval]
+permissions:
+  contents: read
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Comprobar secreto
+        env: {GEMINI_API_KEY: "${{ secrets.GEMINI_API_KEY }}"}
+        run: '[ -n "$GEMINI_API_KEY" ] || { echo "Falta el secreto GEMINI_API_KEY"; exit 1; }'
+      - name: Preguntar a Gemini
+        env: {GEMINI_API_KEY: "${{ secrets.GEMINI_API_KEY }}"}
+        run: python3 gemini_eval.py set1 gemini-3.1-flash-lite
+      - name: Puntuar
+        if: always()
+        run: |
+          python3 score.py set1 gemini_gemini-3.1-flash-lite.json || true
+          python3 score.py set1 gemini_gemini-3.1-flash-lite.json 0.7 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: resultados, path: set1/gemini_*.json, if-no-files-found: ignore}
