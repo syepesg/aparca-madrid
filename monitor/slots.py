@@ -40,6 +40,10 @@ MIN_DWELL = 40 * 60              # con un solo coche visto, debe haber estado al
 CANDIDATE_TTL = 2 * 86400
 SLOT_TTL = 10 * 86400
 VIEW_SIM = 0.75                  # parecido mínimo para considerar que es el mismo encuadre
+CLEAR_VIEW_SIM = 0.85            # para declarar huecos nuevos la imagen debe encajar claramente
+                                 # (reflejos del sol, neblina o lluvia en la lente lo bajan)
+STABLE_FREE_SIM = 0.60           # el hueco debe verse igual en las dos capturas (no ramas ni peatones)
+MIN_PATCH_INFO = 40              # brillo medio mínimo del parche para fiarse (sombra profunda, noche)
 MAX_VIEWS = 6                    # muchas cámaras rotan entre posiciones fijas o hacen zoom
 VIEW_TTL = 2 * 86400             # encuadres sin plazas que no se repiten caducan
 
@@ -174,7 +178,8 @@ def match_view(state: dict, thumb: np.ndarray, mask: np.ndarray, ts: float):
 
 def update_camera(state: dict, dets: list, ts: float, img: Image.Image):
     """Asigna la captura a un encuadre y actualiza sus plazas. Devuelve eventos de liberación."""
-    return update_view(assign_view(state, dets, ts, img), dets, ts, img)
+    view = assign_view(state, dets, ts, img)
+    return update_view(view, dets, ts, img, clear=state.get("view_sim", 1) >= CLEAR_VIEW_SIM)
 
 
 def assign_view(state: dict, dets: list, ts: float, img: Image.Image):
@@ -188,7 +193,7 @@ def assign_view(state: dict, dets: list, ts: float, img: Image.Image):
     return view
 
 
-def update_view(view: dict, dets: list, ts: float, img: Image.Image):
+def update_view(view: dict, dets: list, ts: float, img: Image.Image, clear: bool = True):
     slots = view.setdefault("slots", [])
     events = []
     parked = [d for d in dets if d["cls"] in PARKABLE and big_enough(d["box"])]
@@ -241,13 +246,23 @@ def update_view(view: dict, dets: list, ts: float, img: Image.Image):
             # referencia de "coche aquí" solo cuando la detección encaja bien con la plaza
             if any(iou(s["box"], b) >= 0.5 for b in all_boxes):
                 s["ref_occ"] = enc(sp)
-        elif "ref_occ" in s and similarity(sp, dec(s["ref_occ"])) >= STILL_THERE_SIM:
-            occupied = True    # YOLO no lo ve, pero la imagen no ha cambiado
-            s["miss_n"] = s.get("miss_n", 0) + 1
         elif "ref_occ" not in s:
             occupied = True    # sin referencia no podemos asegurar que esté libre
+        elif similarity(sp, dec(s["ref_occ"])) >= STILL_THERE_SIM:
+            occupied = True    # YOLO no lo ve, pero la imagen no ha cambiado
+            s["miss_n"] = s.get("miss_n", 0) + 1
+            if similarity(sp, dec(s["ref_occ"])) >= 0.75:
+                s["ref_occ"] = enc(sp)   # seguir los cambios graduales de luz
+        elif sp.mean() < MIN_PATCH_INFO or dec(s["ref_occ"]).mean() < MIN_PATCH_INFO:
+            occupied = True    # demasiado oscuro para saberlo
+        elif s["state"] == "occupied" and not clear:
+            occupied = True    # imagen dudosa (reflejos, neblina): no declarar huecos nuevos
+        elif s["state"] == "free" and "free_patch" in s and similarity(sp, dec(s["free_patch"])) < STABLE_FREE_SIM:
+            occupied = True    # el "hueco" cambia de una captura a otra: algo se mueve encima
         else:
             occupied = False
+        if not occupied:
+            s["free_patch"] = enc(sp)
 
         if occupied:
             s["last_occupied"] = ts

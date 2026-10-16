@@ -91,7 +91,7 @@ def analyze(detector, st: dict, img: Image.Image, ts: float):
     rois = slot_rois([s for s in view["slots"] if sl.is_real_slot(s)])
     if rois:
         dets = merge_dets(dets, detector.detect_image(img, rois, full=False)[0])
-    return dets, sl.update_view(view, dets, ts, img)
+    return dets, sl.update_view(view, dets, ts, img, clear=st.get("view_sim", 1) >= sl.CLEAR_VIEW_SIM)
 
 
 def public_camera(cam, st, now):
